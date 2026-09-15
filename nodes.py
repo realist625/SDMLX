@@ -10,6 +10,8 @@ import sys
 import time
 from pathlib import Path
 
+from .mlx_sd.prompt_weighting import tokenize_with_weights
+
 SDMLX_IMPORT_ERROR = None
 
 try:
@@ -115,6 +117,7 @@ MODEL_CACHE_META = {}
 TOKENIZER_CACHE = {}
 CONDITIONING_CACHE = {}
 CONDITIONING_GUARD_CACHE = {}
+EMPTY_CONDITIONING_CACHE = {}
 COMPILED_STEP_DENOISERS = {}
 COMPILED_VAE_DECODERS = {}
 INPAINT_DETAILER_PREP_CACHE = {}
@@ -152,6 +155,7 @@ SDMLX_CONDITIONING_DIAGNOSTICS = SDMLX_CONDITIONING_DIAGNOSTICS_MODE in {
     "full",
     "all",
 }
+SDMLX_EMPHASIS_DIAGNOSTICS = sdmlx_env_flag("SDMLX_EMPHASIS_DIAGNOSTICS")
 SDMLX_SAFE_MODE = sdmlx_env_flag("SDMLX_SAFE_MODE")
 SDMLX_DISABLE_STEP_COMPILE = SDMLX_SAFE_MODE or sdmlx_env_flag("SDMLX_DISABLE_STEP_COMPILE")
 SDMLX_DISABLE_FAST_ATTENTION = SDMLX_SAFE_MODE or sdmlx_env_flag("SDMLX_DISABLE_FAST_ATTENTION")
@@ -159,7 +163,7 @@ SDMLX_CONDITIONING_GUARD = not sdmlx_env_flag("SDMLX_DISABLE_CONDITIONING_GUARD"
 SDMLX_NAN_DIAGNOSTICS = sdmlx_env_flag("SDMLX_NAN_DIAGNOSTICS")
 SDMLX_CONDITIONING_DIAGNOSTICS_HEADER_PRINTED = False
 TIMING_LOGS_ENABLED = SDMLX_VERBOSE_LOGS
-CONDITIONING_CACHE_VERSION = "shared-tokenizer-v2"
+CONDITIONING_CACHE_VERSION = "prompt-weights-v3"
 MEMORY_CACHE_POLICY = {
     "mode": "balanced",
     "reserve_gb": None,
@@ -5588,6 +5592,9 @@ def evict_model_cache_key(key):
     MODEL_CACHE.pop(key, None)
     if meta.get("kind") == "unet" and isinstance(key, tuple) and key:
         clear_compiled_step_denoisers_for_source(key[0])
+    if meta.get("kind") == "clip" and isinstance(key, tuple) and key:
+        for empty_key in [k for k in EMPTY_CONDITIONING_CACHE if k[0] == key[0]]:
+            EMPTY_CONDITIONING_CACHE.pop(empty_key, None)
     release_mlx_cache_memory()
     return meta
 
@@ -6926,43 +6933,98 @@ def profiled_unet_forward(unet, x, timestep, encoder_x, pooled, time_ids, profil
     return timed_eval("out", finish, profile, "out")
 
 
+def _select_conditioning_layer(output, use_last_layer):
+    if use_last_layer:
+        return output.last_hidden_state
+    if output.hidden_states and len(output.hidden_states) >= 2:
+        return output.hidden_states[-2]
+    return output.last_hidden_state
+
+
+def _blend_toward_empty(hidden, weight_rows, empty, label=""):
+    """Blend `hidden` toward/away from `empty` per-token by `weight_rows` (a list of
+    per-sequence python weight lists, one row per batch item). Skips the blend entirely
+    when every weight is 1.0 so plain unweighted prompts stay bit-identical -- the blend
+    is a no-op in exact arithmetic but not under fp16 rounding."""
+    flat = [w for row in weight_rows for w in row]
+    non_unity = [w for w in flat if w != 1.0]
+    if not non_unity:
+        if SDMLX_EMPHASIS_DIAGNOSTICS:
+            print(f"SDMLX Emphasis Diagnostics [{label}]: all weights == 1.0, blend skipped.")
+        return hidden
+    weights = mx.array(weight_rows, dtype=mx.float32)[:, :, None]
+    blended = (empty + weights * (hidden - empty)).astype(hidden.dtype)
+    if SDMLX_EMPHASIS_DIAGNOSTICS:
+        delta_norm = mlx_rms(blended.astype(mx.float32) - hidden.astype(mx.float32))
+        hidden_norm = mlx_rms(hidden.astype(mx.float32))
+        mx.eval(delta_norm, hidden_norm)
+        print(
+            f"SDMLX Emphasis Diagnostics [{label}]: {len(non_unity)}/{len(flat)} tokens weighted "
+            f"(min={min(non_unity):.3f}, max={max(non_unity):.3f}), "
+            f"blend_delta_rms={mlx_scalar_float(delta_norm):.6f}, hidden_rms={mlx_scalar_float(hidden_norm):.6f}"
+        )
+    return blended
+
+
+def get_empty_conditioning_hidden(cache_key, clip_model, tokenizer, is_g, use_last_layer):
+    """The encoding of an empty prompt through `clip_model`, at the same layer used for
+    conditioning. This is the baseline that emphasis-weighted token embeddings are blended
+    toward/away from in `SDMLX_CLIPTextEncode.encode`, matching ComfyUI's default emphasis
+    behavior."""
+    key = (
+        cache_key,
+        "clip_g" if is_g else "clip_l",
+        "last" if use_last_layer else "penultimate",
+    )
+    cached = EMPTY_CONDITIONING_CACHE.get(key)
+    if cached is not None:
+        return cached
+    ids, _weights = tokenize_with_weights(tokenizer, "")
+    tokens = mx.array([ids])
+    output = clip_model(tokens)
+    hidden = _select_conditioning_layer(output, use_last_layer)
+    mx.eval(hidden)
+    EMPTY_CONDITIONING_CACHE[key] = hidden
+    return hidden
+
+
 def encode_text_pair(mlx_clip, positive_text, negative_text, conditioning_mode="normal"):
     cache_key = (CONDITIONING_CACHE_VERSION, mlx_clip["cache_key"], positive_text, negative_text, conditioning_mode)
     if cache_key in CONDITIONING_CACHE:
         pos, neg = CONDITIONING_CACHE[cache_key]
         log_timing("SDMLX: Text pair loaded from RAM cache.")
+        if SDMLX_EMPHASIS_DIAGNOSTICS:
+            print(f"SDMLX Emphasis Diagnostics [cache]: HIT (positive_text len={len(positive_text)})")
         return pos, neg
+    if SDMLX_EMPHASIS_DIAGNOSTICS:
+        print(f"SDMLX Emphasis Diagnostics [cache]: MISS, computing fresh (positive_text len={len(positive_text)})")
 
     clip_l = get_clip_model(mlx_clip["cache_key"], mlx_clip["clip_l"], is_g=False)
     clip_g = get_clip_model(mlx_clip["cache_key"], mlx_clip["clip_g"], is_g=True)
     tokenizer_l = get_clip_l_tokenizer()
     tokenizer_g = get_clip_g_tokenizer()
-    tokens_l = mx.array(
-        tokenizer_l(
-            [positive_text, negative_text],
-            padding="max_length",
-            max_length=77,
-            truncation=True,
-            return_tensors="np",
-        )["input_ids"]
-    )
-    tokens_g = mx.array(
-        tokenizer_g(
-            [positive_text, negative_text],
-            padding="max_length",
-            max_length=77,
-            truncation=True,
-            return_tensors="np",
-        )["input_ids"]
-    )
+
+    ids_l_pos, w_l_pos = tokenize_with_weights(tokenizer_l, positive_text)
+    ids_l_neg, w_l_neg = tokenize_with_weights(tokenizer_l, negative_text)
+    ids_g_pos, w_g_pos = tokenize_with_weights(tokenizer_g, positive_text)
+    ids_g_neg, w_g_neg = tokenize_with_weights(tokenizer_g, negative_text)
+
+    tokens_l = mx.array([ids_l_pos, ids_l_neg])
+    tokens_g = mx.array([ids_g_pos, ids_g_neg])
 
     output_l = clip_l(tokens_l)
     output_g = clip_g(tokens_g)
-    hidden_l = output_l.hidden_states[-2] if output_l.hidden_states and len(output_l.hidden_states) >= 2 else output_l.last_hidden_state
-    if conditioning_mode == "clip_g_last":
-        hidden_g = output_g.last_hidden_state
-    else:
-        hidden_g = output_g.hidden_states[-2] if output_g.hidden_states and len(output_g.hidden_states) >= 2 else output_g.last_hidden_state
+    use_last_g = conditioning_mode == "clip_g_last"
+    hidden_l = _select_conditioning_layer(output_l, use_last_layer=False)
+    hidden_g = _select_conditioning_layer(output_g, use_last_layer=use_last_g)
+
+    # Emphasis syntax -- (text:weight)/(text)/[text] -- blends each token's contextualized
+    # embedding toward/away from its embedding in an unweighted ("empty prompt") encoding,
+    # by that token's weight. Unweighted tokens have weight 1.0, which is a no-op here.
+    empty_l = get_empty_conditioning_hidden(mlx_clip["cache_key"], clip_l, tokenizer_l, is_g=False, use_last_layer=False)
+    empty_g = get_empty_conditioning_hidden(mlx_clip["cache_key"], clip_g, tokenizer_g, is_g=True, use_last_layer=use_last_g)
+    hidden_l = _blend_toward_empty(hidden_l, [w_l_pos, w_l_neg], empty_l, label="pair/clip_l")
+    hidden_g = _blend_toward_empty(hidden_g, [w_g_pos, w_g_neg], empty_g, label="pair/clip_g")
 
     if conditioning_mode == "clip_l_only":
         hidden_g = mx.zeros_like(hidden_g)
@@ -10432,20 +10494,29 @@ class SDMLX_CLIPTextEncode:
         if conditioning_key in CONDITIONING_CACHE:
             cached = CONDITIONING_CACHE[conditioning_key]
             log_timing("SDMLX: CLIP conditioning loaded from RAM cache.")
+            if SDMLX_EMPHASIS_DIAGNOSTICS:
+                print(f"SDMLX Emphasis Diagnostics [cache]: HIT (text len={len(text)})")
             if isinstance(cached, dict):
                 return ({**cached, "model_family": "sdxl"},)
             cond, pooled = cached
             return ({"cond": cond, "pooled": pooled, "text": text, "model_family": "sdxl"},)
+        if SDMLX_EMPHASIS_DIAGNOSTICS:
+            print(f"SDMLX Emphasis Diagnostics [cache]: MISS, computing fresh (text len={len(text)})")
 
         def run_clip(data, is_g=False):
             if not data: return None
 
             clip = get_clip_model(mlx_clip["cache_key"], data, is_g=is_g)
             tokenizer = get_clip_g_tokenizer() if is_g else get_clip_l_tokenizer()
-            tokens = mx.array(tokenizer(text, padding="max_length", max_length=77, truncation=True, return_tensors="np")["input_ids"])
+            ids, token_weights = tokenize_with_weights(tokenizer, text)
+            tokens = mx.array([ids])
             output = clip(tokens)
-            if output.hidden_states and len(output.hidden_states) >= 2:
-                output.last_hidden_state = output.hidden_states[-2]
+            hidden = _select_conditioning_layer(output, use_last_layer=False)
+            # Emphasis syntax -- (text:weight)/(text)/[text] -- see get_empty_conditioning_hidden.
+            empty = get_empty_conditioning_hidden(mlx_clip["cache_key"], clip, tokenizer, is_g=is_g, use_last_layer=False)
+            output.last_hidden_state = _blend_toward_empty(
+                hidden, [token_weights], empty, label=f"single/{'clip_g' if is_g else 'clip_l'}"
+            )
             return output
 
         res_l = run_clip(mlx_clip["clip_l"], is_g=False)
