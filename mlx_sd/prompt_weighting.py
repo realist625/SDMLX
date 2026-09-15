@@ -142,20 +142,9 @@ def parse_prompt_weights(text: str) -> List[Tuple[str, float]]:
     return [(_unescape_literal_parens(chunk), weight) for chunk, weight in pairs]
 
 
-def tokenize_with_weights(tokenizer, text: str, max_length: int = 77) -> Tuple[List[int], List[float]]:
-    """Tokenize `text` honoring emphasis syntax.
-
-    Returns `(token_ids, weights)`, both of length `max_length`, laid out the same way a plain
-    `tokenizer(text, padding="max_length", max_length=max_length, truncation=True)` call would
-    (bos, ..., eos, pad, pad, ...) but with a per-token weight instead of an implicit 1.0.
-    Unweighted text produces weight 1.0 for every real token, so plain prompts are unaffected.
-    """
-    bos = tokenizer.bos_token_id
-    eos = tokenizer.eos_token_id
-    pad = tokenizer.pad_token_id
-    if pad is None:
-        pad = eos
-
+def _flat_ids_and_weights(tokenizer, text: str) -> Tuple[List[int], List[float]]:
+    """Tokenize `text` (honoring emphasis syntax) into a flat, unbounded list of token ids
+    and per-token weights -- no bos/eos/padding, no length limit."""
     ids: List[int] = []
     weights: List[float] = []
     for chunk_text, weight in parse_prompt_weights(text):
@@ -164,6 +153,27 @@ def tokenize_with_weights(tokenizer, text: str, max_length: int = 77) -> Tuple[L
         chunk_ids = tokenizer.encode(chunk_text, add_special_tokens=False)
         ids.extend(chunk_ids)
         weights.extend([weight] * len(chunk_ids))
+    return ids, weights
+
+
+def tokenize_with_weights(tokenizer, text: str, max_length: int = 77) -> Tuple[List[int], List[float]]:
+    """Tokenize `text` honoring emphasis syntax.
+
+    Returns `(token_ids, weights)`, both of length `max_length`, laid out the same way a plain
+    `tokenizer(text, padding="max_length", max_length=max_length, truncation=True)` call would
+    (bos, ..., eos, pad, pad, ...) but with a per-token weight instead of an implicit 1.0.
+    Unweighted text produces weight 1.0 for every real token, so plain prompts are unaffected.
+
+    Content beyond `max_length - 2` real tokens is silently truncated -- use
+    `tokenize_with_weights_chunks` instead where long prompts must not lose content.
+    """
+    bos = tokenizer.bos_token_id
+    eos = tokenizer.eos_token_id
+    pad = tokenizer.pad_token_id
+    if pad is None:
+        pad = eos
+
+    ids, weights = _flat_ids_and_weights(tokenizer, text)
 
     body_len = max(max_length - 2, 0)
     ids = ids[:body_len]
@@ -178,3 +188,44 @@ def tokenize_with_weights(tokenizer, text: str, max_length: int = 77) -> Tuple[L
         out_weights.extend([1.0] * pad_count)
 
     return out_ids, out_weights
+
+
+def tokenize_with_weights_chunks(tokenizer, text: str, chunk_size: int = 75) -> List[Tuple[List[int], List[float]]]:
+    """Tokenize `text` honoring emphasis syntax, splitting into as many `chunk_size`-token
+    windows as needed instead of truncating -- matching ComfyUI's handling of prompts longer
+    than one CLIP window (CLIP's position embeddings are fixed at 77, so each chunk is encoded
+    through CLIP separately and the resulting embeddings are concatenated afterward).
+
+    Returns a list of `(token_ids, weights)` pairs, each of length `chunk_size + 2`
+    (bos, ..., eos, pad...), laid out the same way `tokenize_with_weights` lays out its single
+    chunk. A prompt that fits in one window returns a single-element list with output
+    identical to `tokenize_with_weights(tokenizer, text, max_length=chunk_size + 2)`. An empty
+    prompt also returns a single (all-pad) chunk, never an empty list.
+    """
+    bos = tokenizer.bos_token_id
+    eos = tokenizer.eos_token_id
+    pad = tokenizer.pad_token_id
+    if pad is None:
+        pad = eos
+
+    ids, weights = _flat_ids_and_weights(tokenizer, text)
+    max_length = chunk_size + 2
+
+    if not ids:
+        return [([bos, eos] + [pad] * chunk_size, [1.0] * max_length)]
+
+    chunks: List[Tuple[List[int], List[float]]] = []
+    for start in range(0, len(ids), chunk_size):
+        body_ids = ids[start : start + chunk_size]
+        body_weights = weights[start : start + chunk_size]
+
+        out_ids = [bos] + body_ids + [eos]
+        out_weights = [1.0] + body_weights + [1.0]
+
+        pad_count = max_length - len(out_ids)
+        if pad_count > 0:
+            out_ids.extend([pad] * pad_count)
+            out_weights.extend([1.0] * pad_count)
+
+        chunks.append((out_ids, out_weights))
+    return chunks

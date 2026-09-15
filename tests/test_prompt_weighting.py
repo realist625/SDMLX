@@ -1,6 +1,10 @@
 import unittest
 
-from ..mlx_sd.prompt_weighting import parse_prompt_weights, tokenize_with_weights
+from ..mlx_sd.prompt_weighting import (
+    parse_prompt_weights,
+    tokenize_with_weights,
+    tokenize_with_weights_chunks,
+)
 
 
 class ParsePromptWeightsTests(unittest.TestCase):
@@ -144,6 +148,69 @@ class TokenizeWithWeightsTests(unittest.TestCase):
         self.assertEqual(len(ids), 5)
         self.assertEqual(ids[0], tokenizer.bos_token_id)
         self.assertEqual(ids[-1], tokenizer.eos_token_id)
+
+
+class TokenizeWithWeightsChunksTests(unittest.TestCase):
+    def test_short_prompt_matches_single_chunk_tokenize_with_weights(self):
+        tokenizer = _FakeTokenizer()
+        chunks = tokenize_with_weights_chunks(tokenizer, "a photo of a cat", chunk_size=8)
+        self.assertEqual(len(chunks), 1)
+        expected = tokenize_with_weights(tokenizer, "a photo of a cat", max_length=10)
+        self.assertEqual(chunks[0], expected)
+
+    def test_empty_prompt_is_one_all_pad_chunk(self):
+        tokenizer = _FakeTokenizer()
+        chunks = tokenize_with_weights_chunks(tokenizer, "", chunk_size=8)
+        self.assertEqual(len(chunks), 1)
+        ids, weights = chunks[0]
+        self.assertEqual(len(ids), 10)
+        self.assertEqual(ids[0], tokenizer.bos_token_id)
+        self.assertEqual(ids[1], tokenizer.eos_token_id)
+        self.assertEqual(ids[2:], [tokenizer.pad_token_id] * 8)
+        self.assertEqual(weights, [1.0] * 10)
+
+    def test_long_prompt_splits_into_multiple_full_chunks(self):
+        tokenizer = _FakeTokenizer()
+        # 10 words, chunk_size=4 -> chunks of 4, 4, 2 real tokens.
+        text = "one two three four five six seven eight nine ten"
+        chunks = tokenize_with_weights_chunks(tokenizer, text, chunk_size=4)
+        self.assertEqual(len(chunks), 3)
+        for ids, weights in chunks:
+            self.assertEqual(len(ids), 6)
+            self.assertEqual(len(weights), 6)
+            self.assertEqual(ids[0], tokenizer.bos_token_id)
+
+        # First two chunks are fully packed (no padding); no content is dropped.
+        first_ids, _ = chunks[0]
+        second_ids, _ = chunks[1]
+        third_ids, _ = chunks[2]
+        self.assertNotIn(tokenizer.pad_token_id, first_ids[1:-1])
+        self.assertNotIn(tokenizer.pad_token_id, second_ids[1:-1])
+        # Last chunk holds the remaining 2 real tokens, then eos, then padding.
+        self.assertEqual(third_ids[1:3], [108, 109])
+        self.assertEqual(third_ids[3], tokenizer.eos_token_id)
+        self.assertEqual(third_ids[4:], [tokenizer.pad_token_id] * 2)
+
+    def test_no_content_is_lost_across_chunks(self):
+        tokenizer = _FakeTokenizer()
+        text = " ".join(f"word{i}" for i in range(20))
+        chunks = tokenize_with_weights_chunks(tokenizer, text, chunk_size=6)
+        # Reassemble every real (non bos/eos/pad) token across all chunks, in order.
+        special = {tokenizer.bos_token_id, tokenizer.eos_token_id, tokenizer.pad_token_id}
+        recovered = [tid for ids, _w in chunks for tid in ids if tid not in special]
+        self.assertEqual(recovered, list(range(100, 120)))
+
+    def test_weights_travel_with_their_tokens_across_chunk_boundary(self):
+        tokenizer = _FakeTokenizer()
+        # 5 plain words then one weighted word, chunk_size=5 puts the weighted word alone
+        # in the second chunk.
+        text = "a b c d e (weighted:0.7)"
+        chunks = tokenize_with_weights_chunks(tokenizer, text, chunk_size=5)
+        self.assertEqual(len(chunks), 2)
+        _ids0, weights0 = chunks[0]
+        self.assertEqual(weights0[1:6], [1.0] * 5)
+        ids1, weights1 = chunks[1]
+        self.assertEqual(weights1[1], 0.7)
 
 
 if __name__ == "__main__":

@@ -10,7 +10,7 @@ import sys
 import time
 from pathlib import Path
 
-from .mlx_sd.prompt_weighting import tokenize_with_weights
+from .mlx_sd.prompt_weighting import tokenize_with_weights, tokenize_with_weights_chunks
 
 SDMLX_IMPORT_ERROR = None
 
@@ -163,7 +163,7 @@ SDMLX_CONDITIONING_GUARD = not sdmlx_env_flag("SDMLX_DISABLE_CONDITIONING_GUARD"
 SDMLX_NAN_DIAGNOSTICS = sdmlx_env_flag("SDMLX_NAN_DIAGNOSTICS")
 SDMLX_CONDITIONING_DIAGNOSTICS_HEADER_PRINTED = False
 TIMING_LOGS_ENABLED = SDMLX_VERBOSE_LOGS
-CONDITIONING_CACHE_VERSION = "prompt-weights-v3"
+CONDITIONING_CACHE_VERSION = "prompt-weights-v4"
 MEMORY_CACHE_POLICY = {
     "mode": "balanced",
     "reserve_gb": None,
@@ -7003,28 +7003,53 @@ def encode_text_pair(mlx_clip, positive_text, negative_text, conditioning_mode="
     clip_g = get_clip_model(mlx_clip["cache_key"], mlx_clip["clip_g"], is_g=True)
     tokenizer_l = get_clip_l_tokenizer()
     tokenizer_g = get_clip_g_tokenizer()
-
-    ids_l_pos, w_l_pos = tokenize_with_weights(tokenizer_l, positive_text)
-    ids_l_neg, w_l_neg = tokenize_with_weights(tokenizer_l, negative_text)
-    ids_g_pos, w_g_pos = tokenize_with_weights(tokenizer_g, positive_text)
-    ids_g_neg, w_g_neg = tokenize_with_weights(tokenizer_g, negative_text)
-
-    tokens_l = mx.array([ids_l_pos, ids_l_neg])
-    tokens_g = mx.array([ids_g_pos, ids_g_neg])
-
-    output_l = clip_l(tokens_l)
-    output_g = clip_g(tokens_g)
     use_last_g = conditioning_mode == "clip_g_last"
-    hidden_l = _select_conditioning_layer(output_l, use_last_layer=False)
-    hidden_g = _select_conditioning_layer(output_g, use_last_layer=use_last_g)
+
+    # Prompts longer than one 77-token CLIP window are split into multiple windows here
+    # (matching ComfyUI's own handling of long prompts) rather than silently truncated.
+    # Positive and negative are padded to the same chunk count with empty (all-pad) chunks
+    # so they can still be batched together into one CLIP forward call per chunk.
+    chunks_l_pos = tokenize_with_weights_chunks(tokenizer_l, positive_text)
+    chunks_l_neg = tokenize_with_weights_chunks(tokenizer_l, negative_text)
+    chunks_g_pos = tokenize_with_weights_chunks(tokenizer_g, positive_text)
+    chunks_g_neg = tokenize_with_weights_chunks(tokenizer_g, negative_text)
+    num_chunks = max(len(chunks_l_pos), len(chunks_l_neg), len(chunks_g_pos), len(chunks_g_neg))
+    empty_chunk_l = tokenize_with_weights_chunks(tokenizer_l, "")[0]
+    empty_chunk_g = tokenize_with_weights_chunks(tokenizer_g, "")[0]
+    chunks_l_pos += [empty_chunk_l] * (num_chunks - len(chunks_l_pos))
+    chunks_l_neg += [empty_chunk_l] * (num_chunks - len(chunks_l_neg))
+    chunks_g_pos += [empty_chunk_g] * (num_chunks - len(chunks_g_pos))
+    chunks_g_neg += [empty_chunk_g] * (num_chunks - len(chunks_g_neg))
 
     # Emphasis syntax -- (text:weight)/(text)/[text] -- blends each token's contextualized
     # embedding toward/away from its embedding in an unweighted ("empty prompt") encoding,
     # by that token's weight. Unweighted tokens have weight 1.0, which is a no-op here.
     empty_l = get_empty_conditioning_hidden(mlx_clip["cache_key"], clip_l, tokenizer_l, is_g=False, use_last_layer=False)
     empty_g = get_empty_conditioning_hidden(mlx_clip["cache_key"], clip_g, tokenizer_g, is_g=True, use_last_layer=use_last_g)
-    hidden_l = _blend_toward_empty(hidden_l, [w_l_pos, w_l_neg], empty_l, label="pair/clip_l")
-    hidden_g = _blend_toward_empty(hidden_g, [w_g_pos, w_g_neg], empty_g, label="pair/clip_g")
+
+    hidden_l_chunks = []
+    hidden_g_chunks = []
+    pooled = None
+    for i in range(num_chunks):
+        ids_l_pos, w_l_pos = chunks_l_pos[i]
+        ids_l_neg, w_l_neg = chunks_l_neg[i]
+        ids_g_pos, w_g_pos = chunks_g_pos[i]
+        ids_g_neg, w_g_neg = chunks_g_neg[i]
+
+        output_l = clip_l(mx.array([ids_l_pos, ids_l_neg]))
+        output_g = clip_g(mx.array([ids_g_pos, ids_g_neg]))
+        hidden_l = _select_conditioning_layer(output_l, use_last_layer=False)
+        hidden_g = _select_conditioning_layer(output_g, use_last_layer=use_last_g)
+        hidden_l_chunks.append(_blend_toward_empty(hidden_l, [w_l_pos, w_l_neg], empty_l, label=f"pair/clip_l/chunk{i}"))
+        hidden_g_chunks.append(_blend_toward_empty(hidden_g, [w_g_pos, w_g_neg], empty_g, label=f"pair/clip_g/chunk{i}"))
+
+        if i == 0:
+            # ComfyUI parity: the pooled (SDXL vector) embedding always comes from the
+            # first chunk only, regardless of how many chunks the sequence has.
+            pooled = output_g.pooled_output if hasattr(output_g, "pooled_output") else mx.zeros((2, 1280))
+
+    hidden_l = mx.concatenate(hidden_l_chunks, axis=1)
+    hidden_g = mx.concatenate(hidden_g_chunks, axis=1)
 
     if conditioning_mode == "clip_l_only":
         hidden_g = mx.zeros_like(hidden_g)
@@ -7032,7 +7057,6 @@ def encode_text_pair(mlx_clip, positive_text, negative_text, conditioning_mode="
         hidden_l = mx.zeros_like(hidden_l)
 
     cond = mx.concatenate([hidden_l, hidden_g], axis=2)
-    pooled = output_g.pooled_output if hasattr(output_g, "pooled_output") else mx.zeros((2, 1280))
     if conditioning_mode == "zero_pooled":
         pooled = mx.zeros_like(pooled)
     mx.eval(cond, pooled)
@@ -10508,22 +10532,29 @@ class SDMLX_CLIPTextEncode:
 
             clip = get_clip_model(mlx_clip["cache_key"], data, is_g=is_g)
             tokenizer = get_clip_g_tokenizer() if is_g else get_clip_l_tokenizer()
-            ids, token_weights = tokenize_with_weights(tokenizer, text)
-            tokens = mx.array([ids])
-            output = clip(tokens)
-            hidden = _select_conditioning_layer(output, use_last_layer=False)
-            # Emphasis syntax -- (text:weight)/(text)/[text] -- see get_empty_conditioning_hidden.
             empty = get_empty_conditioning_hidden(mlx_clip["cache_key"], clip, tokenizer, is_g=is_g, use_last_layer=False)
-            output.last_hidden_state = _blend_toward_empty(
-                hidden, [token_weights], empty, label=f"single/{'clip_g' if is_g else 'clip_l'}"
-            )
-            return output
+            label = "single/clip_g" if is_g else "single/clip_l"
 
-        res_l = run_clip(mlx_clip["clip_l"], is_g=False)
-        res_g = run_clip(mlx_clip["clip_g"], is_g=True)
-        
-        cond = mx.concatenate([res_l.last_hidden_state, res_g.last_hidden_state], axis=2)
-        pooled = res_g.pooled_output if hasattr(res_g, "pooled_output") else mx.zeros((1, 1280))
+            # Prompts longer than one 77-token CLIP window are split into multiple windows
+            # here (matching ComfyUI's own handling of long prompts) rather than silently
+            # truncated; each window is encoded separately and concatenated afterward.
+            hidden_chunks = []
+            pooled = None
+            for i, (ids, token_weights) in enumerate(tokenize_with_weights_chunks(tokenizer, text)):
+                output = clip(mx.array([ids]))
+                hidden = _select_conditioning_layer(output, use_last_layer=False)
+                # Emphasis syntax -- (text:weight)/(text)/[text] -- see get_empty_conditioning_hidden.
+                hidden_chunks.append(_blend_toward_empty(hidden, [token_weights], empty, label=f"{label}/chunk{i}"))
+                if i == 0:
+                    # ComfyUI parity: pooled (SDXL vector) embedding comes from the first chunk only.
+                    pooled = output.pooled_output if hasattr(output, "pooled_output") else None
+            return mx.concatenate(hidden_chunks, axis=1), pooled
+
+        hidden_l, _pooled_l = run_clip(mlx_clip["clip_l"], is_g=False)
+        hidden_g, pooled_g = run_clip(mlx_clip["clip_g"], is_g=True)
+
+        cond = mx.concatenate([hidden_l, hidden_g], axis=2)
+        pooled = pooled_g if pooled_g is not None else mx.zeros((1, 1280))
         mx.eval(cond, pooled)
         conditioning = {"cond": cond, "pooled": pooled, "text": text, "model_family": "sdxl"}
         CONDITIONING_CACHE[conditioning_key] = conditioning
