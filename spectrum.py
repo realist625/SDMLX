@@ -1144,7 +1144,7 @@ def sample_latents_spectrum(
                 mx.eval(noise_pred)
 
             denoised_latents = None
-            if mask is not None or preview or sampler_name == "dpmpp_2m":
+            if mask is not None or preview or sampler_name in ("dpmpp_2m", "dpmpp_2m_sde"):
                 denoised_latents = core.denoised_latents_estimate(latents, noise_pred, step_scale, step_sigma)
             if mask is not None:
                 denoised_latents = denoised_latents * step_mask + initial_latents * (1.0 - step_mask)
@@ -1165,6 +1165,17 @@ def sample_latents_spectrum(
                 latents = core.heun_sampler_step(latents, noise_pred, step_sigma, next_sigma, denoise_next)
             elif sampler_name == "dpmpp_2m":
                 latents = core.dpmpp_2m_sampler_step(
+                    latents,
+                    denoised_latents,
+                    old_dpmpp_denoised,
+                    step_sigma,
+                    next_sigma,
+                    old_dpmpp_sigma,
+                )
+                old_dpmpp_denoised = denoised_latents
+                old_dpmpp_sigma = core.mx_scalar_float(step_sigma)
+            elif sampler_name == "dpmpp_2m_sde":
+                latents = core.dpmpp_2m_sde_sampler_step(
                     latents,
                     denoised_latents,
                     old_dpmpp_denoised,

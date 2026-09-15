@@ -194,7 +194,7 @@ SDXL_SIZE_PRESETS = [
 ]
 SIZE_PRESETS = ["Custom"] + SDXL_SIZE_PRESETS
 SCHEDULERS = ["normal", "karras", "exponential", "sgm_uniform", "simple"]
-SAMPLERS = ["euler", "euler_ancestral", "heun", "dpmpp_2m", "lcm"]
+SAMPLERS = ["euler", "euler_ancestral", "heun", "dpmpp_2m", "dpmpp_2m_sde", "lcm"]
 TILED_UPSCALE_SCALE_OPTIONS = ["1.5x", "2x", "3x", "4x", "custom"]
 MASK_DETAILER_SCALE_OPTIONS = ["1.5x", "2x", "3x", "4x"]
 HIRES_RESIZE_METHODS = ["lanczos", "bicubic", "bilinear"]
@@ -6132,7 +6132,7 @@ def scheduler_step_plan(sampler, steps, scheduler_name, sampler_name):
             dt = -sigma
             noise_scale = sigma_prev
             out_scale = 1.0 / math.sqrt(sigma_prev2 + 1.0)
-        elif sampler_name in ("euler", "heun", "dpmpp_2m"):
+        elif sampler_name in ("euler", "heun", "dpmpp_2m", "dpmpp_2m_sde"):
             scale = math.sqrt(sigma2 + 1.0)
             dt = sigma_prev - sigma
             noise_scale = 0.0
@@ -6264,6 +6264,45 @@ def dpmpp_2m_sampler_step(latents, denoised, old_denoised, sigma, sigma_next, ol
     ratio = sigma_next_value / sigma_value
     latents_unscaled = unscaled_latents(latents, sigma)
     next_unscaled = latents_unscaled * ratio + denoised_d * (1.0 - ratio)
+    return normalized_latents(next_unscaled, sigma_next)
+
+
+def dpmpp_2m_sde_sampler_step(latents, denoised, old_denoised, sigma, sigma_next, old_sigma, eta=1.0, s_noise=1.0):
+    """DPM-Solver++(2M) SDE, midpoint variant -- the same reference algorithm ComfyUI's own
+    "dpmpp_2m_sde" sampler uses. Like `dpmpp_2m_sampler_step`, this is a linear multistep
+    method (it reuses the previous step's `denoised` estimate for a second-order correction),
+    but replaces the deterministic ODE step with an exponential-integrator SDE step that
+    injects fresh per-step noise -- the stochastic counterpart to `dpmpp_2m`, similar in spirit
+    to how `SimpleEulerAncestralSampler` adds per-step noise on top of the deterministic Euler
+    step. Noise is drawn directly per step rather than through a seeded Brownian-bridge sampler,
+    so -- like this project's existing `euler_ancestral` -- results are deterministic for a
+    given seed but won't bit-match stock ComfyUI's own dpmpp_2m_sde output for the same seed.
+    """
+    sigma_value = max(mx_scalar_float(sigma), 1e-12)
+    sigma_next_value = max(mx_scalar_float(sigma_next), 0.0)
+    if sigma_next_value <= 0.0:
+        return normalized_latents(denoised, sigma_next)
+
+    h = max(math.log(sigma_value / sigma_next_value), 1e-12)
+    eta_h = eta * h
+    decay_weight = math.exp(-eta_h)
+    denoised_weight = -math.expm1(-h - eta_h)
+
+    latents_unscaled = unscaled_latents(latents, sigma)
+    next_unscaled = (sigma_next_value / sigma_value) * decay_weight * latents_unscaled + denoised_weight * denoised
+
+    if old_denoised is not None and old_sigma is not None:
+        old_sigma_value = max(float(old_sigma), sigma_value + 1e-12)
+        h_last = max(math.log(old_sigma_value / sigma_value), 1e-12)
+        r = h_last / h
+        next_unscaled = next_unscaled + 0.5 * denoised_weight * (1.0 / r) * (denoised - old_denoised)
+
+    if eta > 0.0:
+        noise_variance = max(-math.expm1(-2.0 * eta_h), 0.0)
+        if noise_variance > 0.0:
+            noise = mx.random.normal(latents.shape).astype(latents.dtype)
+            next_unscaled = next_unscaled + noise * (sigma_next_value * math.sqrt(noise_variance) * s_noise)
+
     return normalized_latents(next_unscaled, sigma_next)
 
 
@@ -7738,7 +7777,7 @@ def sample_latents(
                 warn_if_nonfinite_mx_array(f"step {global_step} noise prediction", noise_pred)
 
             denoised_latents = None
-            if mask is not None or preview or sampler_name == "dpmpp_2m":
+            if mask is not None or preview or sampler_name in ("dpmpp_2m", "dpmpp_2m_sde"):
                 denoised_latents = denoised_latents_estimate(latents, noise_pred, step_scale, step_sigma)
             if mask is not None:
                 denoised_latents = denoised_latents * step_mask + initial_latents * (1.0 - step_mask)
@@ -7761,6 +7800,17 @@ def sample_latents(
                 latents = heun_sampler_step(latents, noise_pred, step_sigma, next_sigma, denoise_next)
             elif sampler_name == "dpmpp_2m":
                 latents = dpmpp_2m_sampler_step(
+                    latents,
+                    denoised_latents,
+                    old_dpmpp_denoised,
+                    step_sigma,
+                    next_sigma,
+                    old_dpmpp_sigma,
+                )
+                old_dpmpp_denoised = denoised_latents
+                old_dpmpp_sigma = mx_scalar_float(step_sigma)
+            elif sampler_name == "dpmpp_2m_sde":
+                latents = dpmpp_2m_sde_sampler_step(
                     latents,
                     denoised_latents,
                     old_dpmpp_denoised,
