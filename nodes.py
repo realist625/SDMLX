@@ -7027,6 +7027,28 @@ def get_empty_conditioning_hidden(cache_key, clip_model, tokenizer, is_g, use_la
     return hidden
 
 
+def pad_cond_sequence_to_length(cond, target_len, chunk_size=77):
+    """Pad a (1, seq, dim) conditioning tensor up to `target_len` along the sequence axis by
+    repeating its own final chunk_size-token chunk as many times as needed. Used when positive
+    and negative conditioning were produced by two independent CLIPTextEncode calls (so neither
+    knew the other's length) and ended up with a different number of 77-token chunks -- SDMLX
+    batches positive+negative into one UNet forward call, which requires matching sequence
+    lengths. Repeating the sequence's own last chunk keeps the padding in-distribution (real
+    CLIP output, not zeros) without needing tokenizer/CLIP access at this point in the pipeline.
+    """
+    current_len = cond.shape[1]
+    if current_len >= target_len:
+        return cond
+    last_chunk = cond[:, -chunk_size:, :]
+    pad_chunks = []
+    remaining = target_len - current_len
+    while remaining > 0:
+        take = min(chunk_size, remaining)
+        pad_chunks.append(last_chunk[:, :take, :])
+        remaining -= take
+    return mx.concatenate([cond] + pad_chunks, axis=1)
+
+
 def encode_text_pair(mlx_clip, positive_text, negative_text, conditioning_mode="normal"):
     cache_key = (CONDITIONING_CACHE_VERSION, mlx_clip["cache_key"], positive_text, negative_text, conditioning_mode)
     if cache_key in CONDITIONING_CACHE:
@@ -7440,7 +7462,14 @@ def sample_latents(
                 f"({', '.join(non_linear_weight_types)}). Linear is the most stable starting point."
             )
     if use_cfg:
-        context = mx.concatenate([positive["cond"], negative["cond"]], axis=0)
+        pos_cond, neg_cond = positive["cond"], negative["cond"]
+        if pos_cond.shape[1] != neg_cond.shape[1]:
+            # Independent CLIPTextEncode calls for positive/negative can land on a different
+            # chunk count each (see pad_cond_sequence_to_length) -- reconcile before batching.
+            target_len = max(pos_cond.shape[1], neg_cond.shape[1])
+            pos_cond = pad_cond_sequence_to_length(pos_cond, target_len)
+            neg_cond = pad_cond_sequence_to_length(neg_cond, target_len)
+        context = mx.concatenate([pos_cond, neg_cond], axis=0)
         pooled = mx.concatenate([positive["pooled"], negative["pooled"]], axis=0)
         t_ids = mx.concatenate([time_id] * 2, axis=0)
     else:

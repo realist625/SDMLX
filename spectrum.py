@@ -566,7 +566,14 @@ def sample_latents_spectrum(
     time_id = mx.array([time_id_values])
     use_cfg = cfg > 1.0 and not force_no_cfg
     if use_cfg:
-        context = mx.concatenate([positive["cond"], negative["cond"]], axis=0)
+        pos_cond, neg_cond = positive["cond"], negative["cond"]
+        if pos_cond.shape[1] != neg_cond.shape[1]:
+            # Independent CLIPTextEncode calls for positive/negative can land on a different
+            # chunk count each -- reconcile before batching (see core.pad_cond_sequence_to_length).
+            target_len = max(pos_cond.shape[1], neg_cond.shape[1])
+            pos_cond = core.pad_cond_sequence_to_length(pos_cond, target_len)
+            neg_cond = core.pad_cond_sequence_to_length(neg_cond, target_len)
+        context = mx.concatenate([pos_cond, neg_cond], axis=0)
         pooled = mx.concatenate([positive["pooled"], negative["pooled"]], axis=0)
         t_ids = mx.concatenate([time_id] * 2, axis=0)
     else:
